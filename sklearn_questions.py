@@ -55,7 +55,7 @@ from sklearn.base import BaseEstimator
 from sklearn.base import ClassifierMixin
 
 from sklearn.model_selection import BaseCrossValidator
-
+from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.validation import validate_data
 from sklearn.metrics.pairwise import pairwise_distances
@@ -82,6 +82,11 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         self : instance of KNearestNeighbors
             The current instance of the classifier
         """
+        X, y = validate_data(self, X, y)
+        check_classification_targets(y)
+        self.classes_, self._y_encoded = np.unique(y, return_inverse=True)
+        self.X_train_ = X
+        self.y_train_ = y
         return self
 
     def predict(self, X):
@@ -97,7 +102,20 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         y : ndarray, shape (n_test_samples,)
             Predicted class labels for each test data sample.
         """
-        y_pred = np.zeros(X.shape[0])
+        check_is_fitted(self)
+        X = validate_data(self, X, reset=False)
+
+        distances = pairwise_distances(X, self.X_train_)
+        k = min(self.n_neighbors, self.X_train_.shape[0])
+        neighbors = np.argsort(distances, axis=1, kind="stable")[:, :k]
+
+        # Majority vote; ties go to the smallest class, as in scikit-learn.
+        neighbor_labels = self._y_encoded[neighbors]
+        n_classes = len(self.classes_)
+        votes = np.apply_along_axis(
+            np.bincount, 1, neighbor_labels, minlength=n_classes
+        )
+        y_pred = self.classes_[np.argmax(votes, axis=1)]
         return y_pred
 
     def score(self, X, y):
@@ -115,7 +133,8 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         score : float
             Accuracy of the model computed for the (X, y) pairs.
         """
-        return 0.
+        y_pred = self.predict(X)
+        return float(np.mean(y_pred == np.asarray(y)))
 
 
 class MonthlySplit(BaseCrossValidator):
@@ -137,6 +156,30 @@ class MonthlySplit(BaseCrossValidator):
     def __init__(self, time_col='index'):  # noqa: D107
         self.time_col = time_col
 
+    def _get_months(self, X):
+        """Return the month (as a pandas Period) of each sample in X.
+
+        Parameters
+        ----------
+        X : DataFrame or Series
+            Data with a datetime index or a datetime column `time_col`.
+
+        Returns
+        -------
+        months : ndarray of pandas Period
+            The month of each sample.
+        """
+        if self.time_col == 'index':
+            times = X.index
+        else:
+            times = X[self.time_col]
+
+        if not pd.api.types.is_datetime64_any_dtype(times):
+            raise ValueError(
+                f"The column '{self.time_col}' must be of datetime type."
+            )
+        return pd.DatetimeIndex(times).to_period('M')
+
     def get_n_splits(self, X, y=None, groups=None):
         """Return the number of splitting iterations in the cross-validator.
 
@@ -155,7 +198,8 @@ class MonthlySplit(BaseCrossValidator):
         n_splits : int
             The number of splits.
         """
-        return 0
+        months = self._get_months(X)
+        return max(len(months.unique()) - 1, 0)
 
     def split(self, X, y, groups=None):
         """Generate indices to split data into training and test set.
@@ -177,12 +221,12 @@ class MonthlySplit(BaseCrossValidator):
         idx_test : ndarray
             The testing set indices for that split.
         """
-
-        n_samples = X.shape[0]
+        months = self._get_months(X)
+        unique_months = months.unique().sort_values()
         n_splits = self.get_n_splits(X, y, groups)
         for i in range(n_splits):
-            idx_train = range(n_samples)
-            idx_test = range(n_samples)
+            idx_train = np.where(months == unique_months[i])[0]
+            idx_test = np.where(months == unique_months[i + 1])[0]
             yield (
                 idx_train, idx_test
             )
